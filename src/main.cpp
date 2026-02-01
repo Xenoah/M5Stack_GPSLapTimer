@@ -3,6 +3,8 @@
 #include <SD.h>
 #include <SPI.h>
 #include <math.h>
+#include <string.h>
+#include <stdlib.h>
 
 /* =========================================================
    TinyGPS++ 互換っぽい “最小” 自力実装（RMC/GGAのみ）
@@ -111,6 +113,7 @@ private:
 
   void parseTime_hhmmss(const char* s) {
     if (!s || strlen(s) < 6) return;
+    // hhmmss( .sss は無視)
     char hh[3] = { s[0], s[1], 0 };
     char mm[3] = { s[2], s[3], 0 };
     char ss[3] = { s[4], s[5], 0 };
@@ -127,6 +130,7 @@ private:
     int d = atoi(dd);
     int m = atoi(mm);
     int y = atoi(yy);
+    // 80-99 は 1900台、それ以外は 2000台に寄せる
     int full = (y >= 80) ? (1900 + y) : (2000 + y);
     date._day = d;
     date._month = m;
@@ -172,19 +176,21 @@ private:
   void parseLine(char* line) {
     if (!line || line[0] != '$') return;
 
-    char* body = line + 1;
+    // チェックサム検証
+    char* body = line + 1;                 // '$'の次
     char* ast  = strchr(body, '*');
     if (!ast || (ast - body) <= 0) return;
 
     uint8_t cs = 0;
     for (char* p = body; p < ast; ++p) cs ^= (uint8_t)(*p);
 
-    if (strlen(ast) < 3) return;
+    if (strlen(ast) < 3) return;           // "*hh"
     uint8_t sent = hex2byte(ast + 1);
     if (cs != sent) return;
 
-    *ast = '\0';
+    *ast = '\0'; // ここで文末を切る（チェックサム以降無視）
 
+    // CSV分割
     char* fields[24];
     int nf = 0;
     char* save = nullptr;
@@ -193,6 +199,7 @@ private:
     }
     if (nf <= 0) return;
 
+    // type末尾3文字で判定（GPRMC/GNRMC/GLRMC等をまとめて拾う）
     const char* type = fields[0];
     size_t len = strlen(type);
     if (len < 3) return;
@@ -207,7 +214,7 @@ private:
 };
 
 /* =========================================================
-   ここから元コード（機能はそのまま）
+   元コードのグローバル
    ========================================================= */
 TinyGPSPlus gps;
 
@@ -216,17 +223,125 @@ String fname = "/LAP_log.csv";
 
 int YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, LapCount, SatVal, BestLapNum;
 
-float LAT0 = 35.3698692322 , LONG0 = 138.9336547852, LAT, LONG, KMPH, TopSpeed, ALTITUDE, distanceToMeter0, BeforeTime, LAP, LAP1, LAP2, LAP3, LAP4, LAP5, BestLap = 99999, AverageLap, Sprit;
-bool LAPCOUNTNOW, LAPRADchange;
+float LAT0 = 35.3698692322f, LONG0 = 138.9336547852f;
+float LAT, LONG, KMPH, TopSpeed, ALTITUDE, distanceToMeter0, BeforeTime;
+float LAP, LAP1, LAP2, LAP3, LAP4, LAP5, BestLap = 99999.0f, AverageLap, Sprit;
 
-float LAPRAD = 5; // ラップ計測トリガー半径(m)
+bool LAPCOUNTNOW, LAPRADchange;
+float LAPRAD = 5.0f;  // ラップ計測トリガー半径(m)
 long lastdulation;
 
+/* =========================================================
+   差分描画用キャッシュ＆ヘルパ
+   ========================================================= */
+struct UiCache {
+  char timeLine[32]    = "";
+  char sat[8]          = "";
+  char lapPanelKey[32] = "";
+  char delta[16]       = "";
+  uint16_t deltaBg     = 0xFFFF;
+  char elapsed[8]      = "";
+  char bestKey[24]     = "";
+  char avgKey[24]      = "";
+  char speed[16]       = "";
+  char dist[16]        = "";
+  char lapRad[8]       = "";
+  int barAvgW          = -1;
+  int barBestW         = -1;
+};
+static UiCache ui;
+
+static void cacheCopy(char* dst, size_t n, const char* src) {
+  if (!dst || n == 0) return;
+  snprintf(dst, n, "%s", src ? src : "");
+}
+
+static bool drawTextIfChanged(int x, int y, int w, int h,
+                              uint16_t bg, uint16_t fg, int size,
+                              const char* text, char* cache, size_t cacheN,
+                              bool force = false)
+{
+  if (!force && text && cache && strcmp(text, cache) == 0) return false;
+
+  M5.Display.fillRect(x, y, w, h, bg);
+  M5.Display.setTextColor(fg);
+  M5.Display.setTextSize(size);
+  M5.Display.setCursor(x, y);
+  M5.Display.print(text ? text : "");
+  cacheCopy(cache, cacheN, text);
+  return true;
+}
+
+static int clampi(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static void drawStaticUI() {
+  M5.Display.fillScreen(BLACK);
+
+  // 下段の固定ラベル
+  M5.Display.setTextSize(1);
+
+  M5.Display.setCursor(15, 228);
+  M5.Display.setTextColor(ORANGE);
+  M5.Display.print("SET ");
+  M5.Display.setTextColor(CYAN);
+  M5.Display.print("Zero");
+  M5.Display.setTextColor(ORANGE);
+  M5.Display.print("-Point");
+
+  M5.Display.setTextColor(ORANGE);
+  M5.Display.setCursor(120, 228);
+  M5.Display.print("Rad= ");
+
+  M5.Display.setTextColor(ORANGE);
+  M5.Display.setCursor(230, 228);
+  M5.Display.print("Lap Count");
+
+  // GPSラベル
+  M5.Display.setTextColor(CYAN);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(245, 5);
+  M5.Display.print("G P S:");
+
+  // 前ラップ背景（黄色帯）
+  M5.Display.fillRect(0, 20, 320, 59, YELLOW);
+
+  // 経過時間枠
+  M5.Display.drawRoundRect(180, 80, 140, 50, 10, WHITE);
+  M5.Display.setTextColor(WHITE);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(300, 110);
+  M5.Display.print("s");
+
+  // バー枠
+  M5.Display.drawRect(10, 200, 300, 25, WHITE);
+
+  // Best/Average ラベル（値は差分描画）
+  M5.Display.setTextColor(CYAN);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(20, 145);
+  M5.Display.print("Best");
+
+  M5.Display.setTextColor(PINK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(20, 175);
+  M5.Display.print("Average");
+}
+
+/* =========================================================
+   既存関数プロトタイプ
+   ========================================================= */
 void ReadGPS();
 void CountLAP();
 void showvalue(int dulation);
 void writeData();
 
+/* =========================================================
+   setup / loop（loopは使わない）
+   ========================================================= */
 void setup()
 {
   Serial.begin(115200);
@@ -253,27 +368,29 @@ void setup()
     file.close();
   }
 
-  // ============================
-  // ★ loop() を使わず、setup() 内で回す
-  // ============================
+  // 固定UIは1回だけ描画
+  drawStaticUI();
+
+  // ===== loop() を使わず setup内で回す =====
   for (;;) {
-    // 入力更新はループ先頭で1回（レスポンス改善）
-    M5.update();
+    M5.update();   // 入力更新（レスポンス改善）
 
     ReadGPS();
     CountLAP();
-    showvalue(1000);
+    showvalue(100);
 
-    // ESP32系の詰まり・WDT対策
-    delay(1); // yield()でも可
+    delay(1);      // ESP32系の詰まり/WDT対策（yieldでも可）
   }
 }
 
 void loop()
 {
-  // 使わない（バグ回避）
+  // 使わない
 }
 
+/* =========================================================
+   GPS読み取り＆状態更新
+   ========================================================= */
 void ReadGPS()
 {
   // GPSデコード
@@ -297,12 +414,12 @@ void ReadGPS()
   distanceToMeter0 = (float)TinyGPSPlus::distanceBetween(gps.location.lat(), gps.location.lng(), LAT0, LONG0);
   SatVal = gps.satellites.value();
 
-  // ラップ中最高速
+  // ラップ計測中の最高速度
   if (TopSpeed < KMPH) {
     TopSpeed = KMPH;
   }
 
-  // JST変換
+  // JST変換（簡易：日付繰り上げのみ。月末処理などは元コード同様未対応）
   HOUR += 9;
   if (HOUR >= 24) {
     DAY += HOUR / 24;
@@ -330,13 +447,16 @@ void ReadGPS()
   }
 }
 
+/* =========================================================
+   ラップ計測
+   ========================================================= */
 void CountLAP()
 {
   if (distanceToMeter0 >= LAPRAD && !M5.BtnC.isPressed() && LAPCOUNTNOW == true) {
     LAPCOUNTNOW = false;
   }
 
-  // 4ラップ計測
+  // 4ラップ計測（元コードそのまま）
   if (((distanceToMeter0 != 0 && distanceToMeter0 <= LAPRAD) || M5.BtnC.isPressed())
       && LAPCOUNTNOW == false
       && ((millis() - BeforeTime) / 1000) > 10)
@@ -370,61 +490,55 @@ void CountLAP()
   }
 }
 
+/* =========================================================
+   差分描画（変更があった場所だけ更新）
+   ========================================================= */
 void showvalue(int dulation) {
-  if (millis() > lastdulation + dulation)
-  {
-    lastdulation = millis();
+  if (millis() <= lastdulation + dulation) return;
+  lastdulation = millis();
 
-    M5.Display.clear();
-    M5.Display.setTextColor(ORANGE);
-    M5.Display.setTextSize(1);
+  char buf[64];
 
-    // ボタン説明
-    M5.Display.setCursor(15, 228);
-    M5.Display.setTextColor(ORANGE);
-    M5.Display.print("SET ");
-    M5.Display.setTextColor(CYAN);
-    M5.Display.print("Zero");
-    M5.Display.setTextColor(ORANGE);
-    M5.Display.print("-Point");
+  // ===== 時刻表示 =====
+  snprintf(buf, sizeof(buf), "%04d/%02d/%02d %02d:%02d:%02d",
+           YEAR, MONTH, DAY, HOUR, MINUTE, SECOND);
 
-    M5.Display.setTextColor(ORANGE);
-    M5.Display.setCursor(120, 228);
-    M5.Display.print("Rad= ");
-    M5.Display.setTextColor(47072);
-    M5.Display.print(LAPRAD);
-    M5.Display.print(" m");
+  drawTextIfChanged(
+    0, 0, 320, 18,
+    BLACK, WHITE, 2,
+    buf, ui.timeLine, sizeof(ui.timeLine)
+  );
 
-    M5.Display.setTextColor(ORANGE);
-    M5.Display.setCursor(230, 228);
-    M5.Display.print("Lap Count");
+  // ===== 衛星数 =====
+  snprintf(buf, sizeof(buf), "%d", SatVal);
+  drawTextIfChanged(
+    285, 1, 35, 18,
+    BLACK, CYAN, 2,
+    buf, ui.sat, sizeof(ui.sat)
+  );
 
-    // 時刻表示
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(5, 0);
-    M5.Display.print(YEAR);
-    M5.Display.print("/");
-    M5.Display.print(MONTH);
-    M5.Display.print("/");
-    M5.Display.print(DAY);
-    M5.Display.print(" ");
-    M5.Display.print(HOUR);
-    M5.Display.print(":");
-    M5.Display.print(MINUTE);
-    M5.Display.print(":");
-    M5.Display.println(SECOND);
+  // ===== LAPRAD 数字部分 =====
+  snprintf(buf, sizeof(buf), "%.0f", LAPRAD);
+  drawTextIfChanged(
+    165, 228, 40, 12,
+    BLACK, 47072, 1,
+    buf, ui.lapRad, sizeof(ui.lapRad)
+  );
 
-    // 衛星数表示
-    M5.Display.setTextColor(CYAN);
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(245, 5);
-    M5.Display.print("G P S:");
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(285, 1);
-    M5.Display.print(SatVal);
+  // ===== 前ラップ表示（黄色帯：キーが変わった時だけ更新）=====
+  char key[32];
+  if (LapCount > 1) {
+    snprintf(key, sizeof(key), "L%d:%.3f", LapCount - 1, LAP);
+  } else if (LapCount == 1) {
+    float t = (millis() - BeforeTime) / 1000.0f;
+    snprintf(key, sizeof(key), "L1:%.3f", t);
+  } else {
+    snprintf(key, sizeof(key), "L0");
+  }
 
-    // 前ラップ表示
+  if (strcmp(key, ui.lapPanelKey) != 0) {
+    cacheCopy(ui.lapPanelKey, sizeof(ui.lapPanelKey), key);
+
     M5.Display.fillRect(0, 20, 320, 59, YELLOW);
     M5.Display.setTextColor(BLACK);
 
@@ -433,94 +547,153 @@ void showvalue(int dulation) {
       M5.Display.setCursor(15, 30);
       M5.Display.print(LapCount - 1);
       M5.Display.print(">");
+
       M5.Display.setTextSize(6);
       M5.Display.print(LAP, 3);
     } else if (LapCount == 1) {
+      M5.Display.setTextSize(3);
       M5.Display.setCursor(15, 30);
       M5.Display.print(LapCount);
       M5.Display.print(">");
+
       M5.Display.setTextSize(6);
-      M5.Display.print((millis() - BeforeTime) / 1000, 3);
+      M5.Display.print((millis() - BeforeTime) / 1000.0f, 3);
     }
+  }
 
-    // タイム差表示
-    if (LAP - LAP1 <= 0) M5.Display.fillRect(1, 80, 178, 50, BLUE);
-    else                M5.Display.fillRect(1, 80, 178, 50, RED);
+  // ===== タイム差（色と値が変わった時だけ）=====
+  float d = (LapCount > 1) ? (LAP - LAP1) : 0.0f;
+  char dstr[16];
+  if (d > 0) snprintf(dstr, sizeof(dstr), "+%.1f", d);
+  else       snprintf(dstr, sizeof(dstr), "%.1f", d);
 
+  uint16_t bg = (d <= 0) ? BLUE : RED;
+
+  if (bg != ui.deltaBg || strcmp(dstr, ui.delta) != 0) {
+    ui.deltaBg = bg;
+    cacheCopy(ui.delta, sizeof(ui.delta), dstr);
+
+    M5.Display.fillRect(1, 80, 178, 50, bg);
+
+    M5.Display.setTextSize(4);
     M5.Display.setTextColor(BLACK);
     M5.Display.setCursor(10, 92);
-    M5.Display.setTextSize(4);
-    if (LAP - LAP1 > 0) M5.Display.print("+");
-    M5.Display.print(LAP - LAP1, 1);
+    M5.Display.print(dstr);
 
     M5.Display.setTextColor(WHITE);
     M5.Display.setCursor(8, 90);
-    M5.Display.setTextSize(4);
-    if (LAP - LAP1 > 0) M5.Display.print("+");
-    M5.Display.print(LAP - LAP1, 1);
+    M5.Display.print(dstr);
+  }
 
-    // 計測時間表示
-    M5.Display.drawRoundRect(180, 80, 140, 50, 10 , WHITE);
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setCursor(190, 90);
-    M5.Display.setTextSize(4);
-    M5.Display.print((millis() - BeforeTime) / 1000, 0);
+  // ===== 経過時間 =====
+  int elapsed = (int)((millis() - BeforeTime) / 1000.0f);
+  snprintf(buf, sizeof(buf), "%d", elapsed);
+  drawTextIfChanged(
+    190, 90, 105, 30,
+    BLACK, WHITE, 4,
+    buf, ui.elapsed, sizeof(ui.elapsed)
+  );
 
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(300, 110);
-    M5.Display.print("s");
+  // ===== Best =====
+  char bestKey[24];
+  if (BestLap != 99999) snprintf(bestKey, sizeof(bestKey), "(%d)%.3f", BestLapNum, BestLap);
+  else                  snprintf(bestKey, sizeof(bestKey), "NONE");
 
-    // ベストラップ表示
-    M5.Display.setTextColor(CYAN);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(20, 145);
-    M5.Display.print("Best(");
-    M5.Display.print(BestLapNum);
-    M5.Display.print(")");
+  if (strcmp(bestKey, ui.bestKey) != 0) {
+    cacheCopy(ui.bestKey, sizeof(ui.bestKey), bestKey);
+
+    M5.Display.fillRect(0, 135, 320, 35, BLACK);
+
     if (BestLap != 99999) {
+      M5.Display.setTextColor(CYAN);
+      M5.Display.setTextSize(2);
+      M5.Display.setCursor(20, 145);
+      M5.Display.print("Best(");
+      M5.Display.print(BestLapNum);
+      M5.Display.print(")");
+
       M5.Display.setCursor(120, 140);
       M5.Display.setTextSize(3);
       M5.Display.print("> ");
       M5.Display.print(BestLap);
+    } else {
+      M5.Display.setTextColor(CYAN);
+      M5.Display.setTextSize(2);
+      M5.Display.setCursor(20, 145);
+      M5.Display.print("Best");
     }
+  }
 
-    // 平均タイム表示
+  // ===== Average =====
+  char avgKey[24];
+  if (AverageLap != 0) snprintf(avgKey, sizeof(avgKey), "%.3f", AverageLap);
+  else                snprintf(avgKey, sizeof(avgKey), "NONE");
+
+  if (strcmp(avgKey, ui.avgKey) != 0) {
+    cacheCopy(ui.avgKey, sizeof(ui.avgKey), avgKey);
+
+    M5.Display.fillRect(0, 170, 320, 28, BLACK);
+
     M5.Display.setTextColor(PINK);
     M5.Display.setTextSize(2);
     M5.Display.setCursor(20, 175);
     M5.Display.print("Average");
+
     if (AverageLap != 0) {
       M5.Display.setCursor(120, 170);
       M5.Display.setTextSize(3);
       M5.Display.print("> ");
       M5.Display.print(AverageLap);
     }
-
-    // ラップ差バー表示
-    if (AverageLap != 0) {
-      M5.Display.fillRect(10, 200, 300 * ((AverageLap - (millis() - BeforeTime) / 1000) / AverageLap), 25, PINK);
-    }
-    if (BestLap != 99999) {
-      M5.Display.fillRect(10, 200, 300 * ((BestLap - (millis() - BeforeTime) / 1000) / BestLap), 25, CYAN);
-    }
-    M5.Display.drawRect(10, 200, 300, 25, WHITE);
-
-    // 時速表示
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setCursor(20, 205);
-    M5.Display.setTextSize(2);
-    M5.Display.print(KMPH, 1);
-    M5.Display.print(" km/h");
-
-    // 原点との相対距離表示
-    M5.Display.setTextColor(WHITE);
-    M5.Display.setCursor(160, 205);
-    M5.Display.setTextSize(2);
-    M5.Display.print(distanceToMeter0, 1);
-    M5.Display.print(" m");
   }
+
+  // ===== バー（毎秒変化しやすい）=====
+  float tsec = (millis() - BeforeTime) / 1000.0f;
+
+  int wAvg = 0;
+  if (AverageLap > 0) {
+    float r = (AverageLap - tsec) / AverageLap;
+    wAvg = clampi((int)(300.0f * r), 0, 300);
+  }
+
+  int wBest = 0;
+  if (BestLap != 99999) {
+    float r = (BestLap - tsec) / BestLap;
+    wBest = clampi((int)(300.0f * r), 0, 300);
+  }
+
+  bool barsChanged = (wAvg != ui.barAvgW) || (wBest != ui.barBestW);
+  if (barsChanged) {
+    ui.barAvgW = wAvg;
+    ui.barBestW = wBest;
+
+    M5.Display.fillRect(10, 200, 300, 25, BLACK);
+    if (wAvg > 0)  M5.Display.fillRect(10, 200, wAvg, 25, PINK);
+    if (wBest > 0) M5.Display.fillRect(10, 200, wBest, 25, CYAN);
+    M5.Display.drawRect(10, 200, 300, 25, WHITE);
+  }
+
+  // ===== 時速・距離（バー更新で塗られるので必要なら強制再描画）=====
+  snprintf(buf, sizeof(buf), "%.1f km/h", KMPH);
+  drawTextIfChanged(
+    20, 205, 130, 18,
+    BLACK, WHITE, 2,
+    buf, ui.speed, sizeof(ui.speed),
+    barsChanged
+  );
+
+  snprintf(buf, sizeof(buf), "%.1f m", distanceToMeter0);
+  drawTextIfChanged(
+    160, 205, 150, 18,
+    BLACK, WHITE, 2,
+    buf, ui.dist, sizeof(ui.dist),
+    barsChanged
+  );
 }
 
+/* =========================================================
+   SD書き込み（元コード準拠）
+   ========================================================= */
 void writeData() {
   file = SD.open(fname , FILE_APPEND);
   if (!file) return;
@@ -530,5 +703,6 @@ void writeData() {
   file.print((String)TopSpeed + ",");
   file.println((String)YEAR + "/" + (String)MONTH + "/" + (String)DAY + "-" + (String)HOUR + ":" + (String)MINUTE + ":" + (String)SECOND + ",");
   file.close();
-  TopSpeed = 0;
+
+  TopSpeed = 0; // 最高速度をリセット
 }
